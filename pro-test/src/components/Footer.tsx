@@ -7,13 +7,13 @@ export const Footer = () => (
   <footer className="border-t border-wm-border bg-[#020202] pt-8 pb-12 px-6 text-center">
     <div className="flex flex-col md:flex-row items-center justify-between max-w-7xl mx-auto text-xs text-wm-muted font-mono">
       <div className="flex items-center gap-3 mb-4 md:mb-0">
-        <img src="/favico/favicon-32x32.png" alt="" width="28" height="28" loading="lazy" className="rounded-full" />
+        <img src="/favico/favicon-32x32.png" alt="" width="28" height="28" className="rounded-full" />
         <span className="font-display font-bold text-sm leading-none tracking-tight text-wm-text">WORLD MONITOR</span>
       </div>
       <div className="flex flex-wrap items-center justify-center gap-x-6 gap-y-2">
         <a href={DASHBOARD_PATH} className="hover:text-wm-text transition-colors">Dashboard</a>
         <a href={ABOUT_DOCS_PATH} className="hover:text-wm-text transition-colors">About</a>
-        <a href="/sources/?utm_source=welcome-footer" className="hover:text-wm-text transition-colors">Sources</a>
+        <a href="/sources/" className="hover:text-wm-text transition-colors">Sources</a>
         <a href="/countries/" className="hover:text-wm-text transition-colors">Countries</a>
         <a href="/chokepoints/" className="hover:text-wm-text transition-colors">Chokepoints</a>
         <a href="/crises/" className="hover:text-wm-text transition-colors">Crises</a>

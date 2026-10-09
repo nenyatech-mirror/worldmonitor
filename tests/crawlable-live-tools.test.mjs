@@ -687,6 +687,42 @@ describe('crawlable live intelligence view models', () => {
     assert.match(withheldTransitCountSentence(''), /for this chokepoint for this period/);
   });
 
+  it('includes a registry measurement limitation only when supplied', () => {
+    const reason = 'Not measured here in this snapshot. A count requires matched AIS entry and exit reports.';
+    assert.equal(withheldTransitCountSentence('Strait of Hormuz', reason),
+      `World Monitor is not currently publishing a transit count for Strait of Hormuz for this period. ${reason}`);
+  });
+
+  it('keeps the registry explanation on live absence and removes it on recovery', async () => {
+    const window = new Window({ url: 'https://www.worldmonitor.app/chokepoints/strait-of-hormuz/' });
+    window.document.body.innerHTML = `<section data-live-chokepoint data-chokepoint-id="hormuz_strait"
+      data-chokepoint-name="Strait of Hormuz" data-transit-measurement-note="A count requires matched AIS entry and exit reports.">
+      <strong data-chokepoint-transits></strong><p data-chokepoint-transits-note></p></section>`;
+    const tool = window.document.querySelector('section');
+    const originalFetch = globalThis.fetch;
+    let available = false;
+    globalThis.fetch = async url => String(url).includes('get-chokepoint-status')
+      ? { ok: true, status: 200, json: async () => ({
+        fetchedAt: new Date().toISOString(), upstreamUnavailable: false,
+        chokepoints: [{ id: 'hormuz_strait', disruptionScore: 70, status: 'red',
+          transitSummary: { todayTotal: available ? 2 : 0, todayCountsAvailable: available, dataAvailable: true } }],
+      }) }
+      : anonymousSessionResponse();
+    try {
+      await loadChokepoint(tool);
+      assert.match(tool.querySelector('[data-chokepoint-transits-note]').textContent, /matched AIS entry and exit/);
+      assert.equal(tool.querySelector('[data-chokepoint-transits-note]').hidden, false);
+      available = true;
+      await loadChokepoint(tool);
+      assert.equal(tool.querySelector('[data-chokepoint-transits]').textContent, '2');
+      assert.equal(tool.querySelector('[data-chokepoint-transits-note]').hidden, true);
+      assert.equal(tool.querySelector('[data-chokepoint-transits-note]').textContent, '');
+    } finally {
+      globalThis.fetch = originalFetch;
+      window.close();
+    }
+  });
+
   it('keeps maximum AIS congestion severity as a score input and AIS event count as context', () => {
     const narrative = chokepointEvidenceNarrative({
       displayName: 'Suez Canal',
@@ -1377,16 +1413,76 @@ describe('crawlable live intelligence view models', () => {
     try {
       await loadHazards(tool);
       assert.deepEqual(replacedUrls, ['/tools/natural-hazard-pulse/?country=JP']);
-      assert.equal(dashboardLink.href, '/dashboard?country=JP&expanded=1&utm_source=seo-tool');
+      assert.equal(dashboardLink.href, '/dashboard?country=JP&expanded=1');
       select.value = '';
       await loadHazards(tool);
-      assert.equal(dashboardLink.href, '/dashboard?utm_source=seo-tool');
+      assert.equal(dashboardLink.href, '/dashboard');
       assert.equal(replacedUrls.at(-1), '/tools/natural-hazard-pulse/');
     } finally {
       globalThis.fetch = originalFetch;
       if (originalWindow === undefined) delete globalThis.window;
       else globalThis.window = originalWindow;
     }
+  });
+
+  it('labels a loaded country reading in plain words and stamps it in UTC', async () => {
+    // The static page prints UTC. Formatting the live stamp in the reader's
+    // zone put "GMT+4" next to a "UTC" header on the same page.
+    const previousTz = process.env.TZ;
+    process.env.TZ = 'Asia/Dubai';
+    const window = new Window({ url: 'https://www.worldmonitor.app/countries/egypt/' });
+    const { document } = window;
+    document.body.innerHTML = `
+      <section class="live-tool" data-live-country-risk data-country-code="EG" data-state="ready">
+        <span class="live-status" data-live-status>Published pulse</span>
+        <div class="grid" data-live-grid aria-busy="false">
+          <div class="metric"><strong><span data-live-score>27</span><small data-live-band>Low</small></strong></div>
+          <div class="metric"><strong data-live-trend>Falling -2</strong></div>
+          <div class="metric"><strong data-live-advisory>Level 2</strong></div>
+          <div class="metric"><strong data-live-sanctions>None in feed</strong></div>
+        </div>
+        <time data-live-updated datetime="2026-08-30T12:00:00.000Z">Published pulse Aug 30, 2026</time>
+      </section>
+    `;
+    const tool = document.querySelector('[data-live-country-risk]');
+    const computedAt = Date.now() - 60_000;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+      if (String(url).includes('get-country-risk')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            advisoryLevel: 'caution',
+            sanctionsActive: false,
+            sanctionsCount: 0,
+            fetchedAt: computedAt,
+            cii: {
+              combinedScore: 24,
+              dynamicScore: 0,
+              trend: 'TREND_DIRECTION_UNSPECIFIED',
+              computedAt,
+              methodologyVersion: 'v8',
+            },
+          }),
+        };
+      }
+      return anonymousSessionResponse();
+    };
+    try {
+      await loadCountryRisk(tool);
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (previousTz === undefined) delete process.env.TZ;
+      else process.env.TZ = previousTz;
+    }
+
+    assert.equal(tool.dataset.state, 'ready');
+    assert.equal(tool.querySelector('[data-live-status]').textContent, 'Live reading');
+    assert.equal(tool.querySelector('[data-live-trend]').textContent, 'No earlier reading');
+    const stamp = tool.querySelector('[data-live-updated]').textContent;
+    assert.match(stamp, /^Computed .+ UTC · methodology v8$/);
+    assert.doesNotMatch(stamp, /GMT/);
   });
 
   it('preserves SSR country and chokepoint pulse values when live refresh fails', async () => {
@@ -1564,6 +1660,7 @@ describe('crawlable live intelligence view models', () => {
       assert.equal(tool.querySelector('[data-cii-country="AE"] [data-cii-score]').textContent, '61');
       assert.equal(tool.querySelector('[data-cii-country="AE"] [data-cii-score]').getAttribute('value'), '61');
       assert.equal(tool.dataset.ciiHydrated, 'true');
+      assert.equal(tool.querySelector('[data-live-status]').textContent, 'Live reading · v8');
 
       phase = 'fail';
       await loadCiiRanking(tool);

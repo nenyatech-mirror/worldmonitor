@@ -607,8 +607,8 @@ export const ENDPOINT_RATE_POLICIES: Record<string, EndpointRatePolicy> = {
   '/api/aviation/v1/search-google-flights': { limit: 30, window: '60 s' },
   '/api/aviation/v1/search-google-dates': { limit: 10, window: '60 s' },
   '/api/aviation/v1/list-aviation-news': { limit: 30, window: '60 s' },
-  // Public relay/HTML discovery has the same scrape fan-out as the legacy
-  // YouTube live endpoint and needs its own fail-closed gateway budget.
+  // Public YouTube video lookups call oEmbed on cache misses (channel live
+  // detection is retired) and keep their own fail-closed gateway budget.
   '/api/aviation/v1/get-youtube-live-stream-info': { limit: 30, window: '60 s' },
   // Interactive fare searches use one provider request on a cache miss.
   // 30/min leaves headroom under the provider's 300-600/min shared quota.
@@ -699,8 +699,8 @@ export const ENDPOINT_RATE_POLICIES: Record<string, EndpointRatePolicy> = {
   '/api/intelligence/v1/search-sec-filings': { limit: 30, window: '60 s' },
   // Public market/economic provider proxies (#6236): caller-controlled symbols,
   // indicators, and year ranges create unbounded cache-key cardinality; the
-  // country-index route is bounded to the 45-country contract but still
-  // proxies Yahoo Finance on a cache miss. None may inherit the global
+  // country-index and price-history routes are bounded to their tracked
+  // symbol sets but still proxy Yahoo Finance on a cache miss. None may inherit the global
   // fail-open budget. The dashboard can legitimately fan out across 50 Pro
   // watchlist symbols, so those three per-symbol routes admit one full load
   // plus headroom. analyze-stock remains separately constrained by the
@@ -712,6 +712,7 @@ export const ENDPOINT_RATE_POLICIES: Record<string, EndpointRatePolicy> = {
   '/api/market/v1/backtest-stock': { limit: 60, window: '60 s' },
   '/api/market/v1/get-insider-transactions': { limit: 60, window: '60 s' },
   '/api/market/v1/get-country-stock-index': { limit: 30, window: '60 s' },
+  '/api/market/v1/get-price-history': { limit: 30, window: '60 s' },
   // Stablecoins are seed-backed for the DEFAULT request, but naming coins the
   // snapshot does not carry reaches CoinGecko, and the caller picks the IDs —
   // unbounded cardinality, so the per-ID-set cache cannot bound spend alone.
@@ -823,9 +824,9 @@ export const ENDPOINT_RATE_POLICIES: Record<string, EndpointRatePolicy> = {
   // source of truth for the audit script and the docs, and
   // tests/rate-limit.test.mts fails if the two copies drift. (#6234)
   //
-  // youtube/live: one request can fan out to the Railway relay AND a full
-  // live-page HTML scrape of youtube.com, so it takes the same 30/min
-  // provider-proxy budget as the batch fan-out routes above.
+  // youtube/live: a video lookup calls youtube.com oEmbed from our egress IPs
+  // (channel live detection answers 410 without upstream work), so it keeps
+  // the same 30/min provider-proxy budget as the batch fan-out routes above.
   '/api/youtube/live': { limit: 30, window: '60 s' },
   // reverse-geocode: already Upstash-cached on a 0.001-degree grid and memoized
   // per cell in the browser (src/utils/reverse-geocode.ts), so 60/min is a
@@ -871,6 +872,13 @@ export const ENDPOINT_RATE_POLICIES: Record<string, EndpointRatePolicy> = {
   '/api/create-checkout': { limit: 5, window: '60 s' },
 };
 
+// Second, per-client-IP checkout budget on top of the per-user one above. Dodo
+// rate-limits our shared API key (#6027), so one client cycling many free
+// accounts could otherwise spend it and block real buyers. Higher than the
+// per-user cap so a single buyer retrying always hits that first; a shared
+// office NAT still gets 10 sessions per 10 minutes.
+export const CHECKOUT_PER_IP_RATE_POLICY = { limit: 10, window: '10 m' } as const;
+
 interface RateLimitPolicyDecision {
   reason: string;
 }
@@ -889,7 +897,7 @@ export const FAIL_CLOSED_ENDPOINT_RATE_POLICY_REQUIRED: Record<string, RateLimit
     reason: 'Public aviation news can fan out to nine RSS feeds when the shared snapshot is unavailable.',
   },
   '/api/aviation/v1/get-youtube-live-stream-info': {
-    reason: 'Public live-stream discovery can fan out to relay and YouTube HTML scrapes on cache misses.',
+    reason: 'Public YouTube video lookups call oEmbed on cache misses; channel live detection is retired.',
   },
   '/api/aviation/v1/search-flight-prices': {
     reason: 'Caller-selected fare searches consume Travelpayouts request quota on cache misses.',
@@ -938,6 +946,9 @@ export const FAIL_CLOSED_ENDPOINT_RATE_POLICY_REQUIRED: Record<string, RateLimit
   },
   '/api/market/v1/get-country-stock-index': {
     reason: 'Per-country stock-index lookups proxy Yahoo Finance on cache miss.',
+  },
+  '/api/market/v1/get-price-history': {
+    reason: 'Per-symbol daily-close history proxies Yahoo Finance on cache miss, up to four symbols per request.',
   },
   '/api/market/v1/list-crypto-quotes': {
     reason: 'Caller-named coin IDs absent from the seed snapshot fan out to CoinGecko on cache miss.',

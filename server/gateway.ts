@@ -300,6 +300,7 @@ const RPC_CACHE_TIER: Record<string, CacheTier> = {
   '/api/aviation/v1/search-google-dates': 'medium',
   '/api/aviation/v1/list-aviation-news': 'slow',
   '/api/market/v1/get-country-stock-index': 'slow',
+  '/api/market/v1/get-price-history': 'static',
 
   '/api/natural/v1/list-natural-events': 'slow',
   '/api/wildfire/v1/list-fire-detections': 'static',
@@ -342,6 +343,7 @@ const RPC_CACHE_TIER: Record<string, CacheTier> = {
   '/api/conflict/v1/get-humanitarian-summary': 'daily',
   '/api/conflict/v1/list-iran-events': 'slow',
   '/api/displacement/v1/get-displacement-summary': 'daily',
+  '/api/displacement/v1/get-internal-displacement': 'daily',
   '/api/displacement/v1/get-population-exposure': 'daily',
   '/api/economic/v1/get-bis-policy-rates': 'daily',
   '/api/economic/v1/get-bis-exchange-rates': 'daily',
@@ -361,6 +363,15 @@ const RPC_CACHE_TIER: Record<string, CacheTier> = {
   '/api/economic/v1/get-crude-inventories': 'daily',
   '/api/economic/v1/get-nat-gas-storage': 'daily',
   '/api/economic/v1/get-eu-yield-curve': 'daily',
+  // Daily macro seed. A miss returns unavailable:true, which the gateway
+  // already keeps out of the shared cache.
+  '/api/economic/v1/get-us-cpi-monthly': 'daily',
+  '/api/economic/v1/get-us-treasury-par-yield-curve': 'daily',
+  '/api/economic/v1/get-us-interest-rates': 'daily',
+  '/api/economic/v1/get-world-cpi-monthly': 'daily',
+  // Daily yield-curve bundle. A miss returns unavailable:true, which the
+  // gateway already keeps out of the shared cache.
+  '/api/economic/v1/get-government-yield-curve': 'daily',
   '/api/supply-chain/v1/get-critical-minerals': 'daily',
   '/api/supply-chain/v1/get-mineral-production': 'daily',
   '/api/military/v1/get-aircraft-details': 'static',
@@ -2434,19 +2445,24 @@ export function createDomainGateway(
       });
     }
 
-    // Merge CORS + handler side-channel headers into response
+    // Merge CORS + handler side-channel headers into response.
+    // Every side channel below is keyed by the Request object the handler
+    // wrote it on, which is requestForHandler: a stamped principal makes it
+    // a clone, so draining the pre-stamp request would silently drop every
+    // header, retryable marker and status override set by an authenticated
+    // caller's handler.
     const mergedHeaders = new Headers(response.headers);
     for (const [key, value] of Object.entries(corsHeaders)) {
       mergedHeaders.set(key, value);
     }
-    const extraHeaders = drainResponseHeaders(request);
+    const extraHeaders = drainResponseHeaders(requestForHandler);
     if (extraHeaders) {
       for (const [key, value] of Object.entries(extraHeaders)) {
         mergedHeaders.set(key, value);
       }
     }
     appendDeprecationPolicyLink(mergedHeaders);
-    const retryableResponse = drainRetryableResponse(request);
+    const retryableResponse = drainRetryableResponse(requestForHandler);
     attachRequiredBboxDiagnosticHeaders(mergedHeaders, pathname, requiredBboxDiagnostic);
 
     // Handler side-channel status override (setSuccessStatusOverride): applied
@@ -2455,7 +2471,7 @@ export function createDomainGateway(
     // thrown ApiError statuses always win. GET success flows are excluded:
     // the ETag/304 + CDN-cache path below assumes 200. Always drained so a
     // set-but-unapplied override can't leak state.
-    const statusOverride = drainSuccessStatusOverride(request);
+    const statusOverride = drainSuccessStatusOverride(requestForHandler);
     const finalStatus =
       statusOverride !== undefined && request.method === 'POST' && response.status === 200
         ? statusOverride

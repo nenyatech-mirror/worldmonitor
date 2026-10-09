@@ -66,13 +66,13 @@ import {
 import {
   FORECAST_EVIDENCE_KEY,
   FORECAST_EVIDENCE_COVERAGE_KEY,
-  FORECAST_EVIDENCE_MAX_LOOKBACK_MS,
   FORECAST_EVIDENCE_TTL_S,
   accumulatorPruneBounds,
   advanceForecastEvidenceCoverage,
   buildForecastEvidenceMember,
+  buildForecastEvidenceRecordWrite,
+  forecastEvidenceLinkHost,
   evidencePruneBounds,
-  forecastEvidenceCoversWindow,
   forecastEvidenceRecordKey,
   isEligibleForecastEvidence,
   parseForecastEvidenceCoverage,
@@ -92,7 +92,7 @@ import { deriveCoreStoryPhase } from '../../../../shared/story-phase.js';
 import { buildTickerDictionary, extractTickers } from '../../../../shared/ticker-extract.js';
 import stocksData from '../../../../shared/stocks.json';
 import { buildClassifyCacheKey } from '../../intelligence/v1/_shared';
-import { getSourceTier, hasSourceTier } from '../../../_shared/source-tiers';
+import { declaredSourceTier, getSourceTier } from '../../../_shared/source-tiers';
 import {
   getSourcePropagandaRisk,
   hasReviewedPropagandaRisk,
@@ -110,6 +110,7 @@ import {
 } from '../../../_shared/cache-keys';
 import { getRelayBaseUrl, getRelayHeaders } from '../../../_shared/relay';
 import diplomacyKeywordsData from '../../../../shared/diplomacy-keywords.json';
+import { NEWS_LANGUAGES } from '../../../../src/shared/public-rpc-cache';
 // #6428: entity corroboration must count publishers, not feed labels.
 import {
   MIN_CORROBORATING_PUBLISHERS,
@@ -122,8 +123,51 @@ import {
 const RSS_ACCEPT = 'application/rss+xml, application/xml, text/xml, */*';
 
 const VALID_VARIANTS = new Set(['full', 'tech', 'finance', 'happy', 'commodity']);
-const DIGEST_LANGUAGES = new Set(['en', 'bg', 'cs', 'fr', 'de', 'el', 'es', 'hr', 'hu', 'it', 'pl', 'pt', 'nl', 'sv', 'ru', 'uk', 'ar', 'fa', 'zh', 'ja', 'ko', 'ro', 'tr', 'th', 'vi', 'hi', 'sw']);
+// The one digest language set, shared with the gateway's public-shape
+// classifier so a CDN-shielded `?lang=xx&public=1` shape and the handler can
+// never disagree. Anything outside it is a 400 (#8360).
+const DIGEST_LANGUAGES = NEWS_LANGUAGES;
+const DEFAULT_DIGEST_LANG = 'en';
+const ISOLATE_FALLBACK_MAX_KEYS = 50;
 const fallbackDigestCache = new Map<string, { data: ListFeedDigestResponse; ts: number }>();
+
+/**
+ * Move an entry to the back of the insertion order so it counts as recently
+ * used. Map has no reorder primitive, so delete + re-set is the idiom.
+ *
+ * #8385 review: recency used to be bumped only when a digest was REBUILT, not
+ * when one was served from this tier. `full:en` is the hottest key and the one
+ * degraded serving depends on, but it is rebuilt rarely — so it drifted to the
+ * front of the order and was evicted first, while being read on every request.
+ */
+function touchIsolateEntry(key: string): void {
+  const entry = fallbackDigestCache.get(key);
+  if (!entry) return;
+  fallbackDigestCache.delete(key);
+  fallbackDigestCache.set(key, entry);
+}
+
+/**
+ * Evict the least-recently-used entry, never the default-language shard.
+ *
+ * #8385 review: the cap (50) is below the legitimate key space — VALID_VARIANTS
+ * x DIGEST_LANGUAGES is 135 — so ordinary multi-locale traffic, not just
+ * abuse, can cycle past it. Pinning `<variant>:en` costs one slot per variant
+ * and keeps the shard every degraded serve falls back to, which is the whole
+ * point of this tier. Raising the cap to 135 instead would mean ~17MB of 126KB
+ * snapshots resident per isolate.
+ */
+function evictOldestIsolateEntry(): void {
+  for (const key of fallbackDigestCache.keys()) {
+    if (key.endsWith(`:${DEFAULT_DIGEST_LANG}`)) continue;
+    fallbackDigestCache.delete(key);
+    return;
+  }
+  // Every resident entry is a pinned default-lang shard: drop the oldest so the
+  // cache still cannot grow without bound.
+  const oldest = fallbackDigestCache.keys().next();
+  if (!oldest.done) fallbackDigestCache.delete(oldest.value);
+}
 const ITEMS_PER_FEED = 5;
 const COUNTRY_ITEMS_PER_FEED = 20;
 const MAX_ITEMS_PER_CATEGORY = 20;
@@ -474,6 +518,9 @@ export interface ParsedItem {
   originPublisherTrusted: boolean;
   title: string;
   link: string;
+  // Host of a link the ingest publisher gate blanked (#8990). Internal: lets
+  // the evidence writer drop a stored link on a host the gate now rejects.
+  blankedLinkHost?: string;
   publishedAt: number;
   isAlert: boolean;
   level: ThreatLevel;
@@ -542,9 +589,9 @@ function resolveCredibilitySourceName(item: CredibilitySourceItem): string {
   // Prefer one identity reviewed by both registries so tier and risk describe
   // the same publisher; then degrade toward whichever curated signal exists.
   return candidates.find(candidate =>
-    hasReviewedPropagandaRisk(candidate) && hasSourceTier(candidate))
+    hasReviewedPropagandaRisk(candidate) && declaredSourceTier(candidate) !== null)
     ?? candidates.find(hasReviewedPropagandaRisk)
-    ?? candidates.find(hasSourceTier)
+    ?? candidates.find(candidate => declaredSourceTier(candidate) !== null)
     ?? rawName;
 }
 
@@ -1045,6 +1092,7 @@ function parseRssXml(xml: string, feed: ServerFeed, variant: string): ParseResul
     if (forDigest) parsedTotal++;
 
     let link: string;
+    let blankedLinkHost = '';
     if (isAtom) {
       const hrefMatch = block.match(/<link[^>]+href=["']([^"']+)["']/);
       link = hrefMatch?.[1] ?? '';
@@ -1148,6 +1196,7 @@ function parseRssXml(xml: string, feed: ServerFeed, variant: string): ParseResul
         `[digest] publisher-link-gate blank feed="${feed.name}" variant=${variant} ` +
           `host="${linkHostnameForLog(link)}"`,
       );
+      blankedLinkHost = forecastEvidenceLinkHost(link);
       link = '';
     }
 
@@ -1157,6 +1206,7 @@ function parseRssXml(xml: string, feed: ServerFeed, variant: string): ParseResul
       originPublisherTrusted,
       title,
       link,
+      ...(blankedLinkHost ? { blankedLinkHost } : {}),
       publishedAt,
       isAlert,
       level: threat.level,
@@ -2007,6 +2057,11 @@ export async function listFeedDigest(
       console.log(`[digest-serving] outcome=unavailable reason=${reason} variant=${variant} lang=${lang}`);
       return empty(at, reason);
     }
+    // A serve-time hit is the strongest possible signal this key is in use, so
+    // it must refresh recency — otherwise the tier evicts the very entry it
+    // exists to keep warm. Safe before the gates below: a key that later proves
+    // unservable is deleted outright by those branches.
+    touchIsolateEntry(fallbackKey);
     if (!revoked.readable) {
       // Same fail-closed rule as the durable tier: replayed content must not
       // go out unfiltered when the suppression set could not be read.
@@ -2192,7 +2247,18 @@ export async function listFeedDigest(
       return await serveDegraded('empty-rebuild', leaderFailure, source !== 'cache');
     }
 
-    if (fallbackDigestCache.size > 50) fallbackDigestCache.clear();
+    // LRU eviction: the legitimate variant x lang key space (135) exceeds the
+    // cap, so ordinary multi-locale traffic must not wipe the warm high-traffic
+    // keys (e.g. full:en) that degraded serving relies on when Redis is unreadable.
+    // Map preserves insertion order, so the first key is the least-recently-used;
+    // re-inserting the touched key refreshes its recency (touchIsolateEntry does
+    // the same on a serve-time hit, so a key being read every request cannot be
+    // evicted as "old" just because it is not due for a rebuild).
+    if (!fallbackDigestCache.has(fallbackKey) && fallbackDigestCache.size >= ISOLATE_FALLBACK_MAX_KEYS) {
+      evictOldestIsolateEntry();
+    } else {
+      fallbackDigestCache.delete(fallbackKey);
+    }
     // Anchor the isolate entry to the CONTENT clock, exactly like acceptedAt:
     // stamping Date.now() re-aged unchanged content on every cache hit, so a
     // steadily-hit digest never expired from this tier and a later replay
@@ -2263,37 +2329,26 @@ function redisPipelineConfirmed(
 }
 
 /**
- * The prune is destructive, so this gate takes no staleness budget: the marker
- * handed in was written by THIS publication and must already reach `nowMs`.
- * (The read path in seed-forecast-resolutions.mjs is the only caller that opts
- * into FORECAST_EVIDENCE_COVERAGE_MAX_LAG_MS.)
+ * Member pruning bounds every accumulator at ACCUMULATOR_RETENTION_MS, the
+ * widest live reader's lookback (inventory on that constant). A scope is pruned
+ * only when this cycle's tracking writes and the key-TTL refresh were confirmed.
  *
- * `evidenceDropped` is deliberately separate from `evidenceWritesConfirmed`:
- * a story whose member could not be built never reached Redis, so it says
- * nothing about whether the writes that DID happen were confirmed. It still
- * blocks the marker advance (and therefore this gate, via coverageAdvanced),
- * but it must not be laundered into a write-failure signal.
+ * `full:en` additionally waits for FORECAST_EVIDENCE_CUTOVER_ENABLED, the
+ * operator's switch for the one-time drop from ~183 days to 8. It no longer
+ * waits for a backfill-certified coverage marker: that marker protected the
+ * resolver's accumulator fallback, which #8995 deleted. Judging reads only the
+ * evidence archive, which this prune never touches, so archive write and
+ * coverage outcomes say nothing about whether the accumulator tail is still
+ * needed (#7082, owner decision 2026-10-08).
  */
 function shouldPruneAccumulator(options: {
   evidenceEligible: boolean;
   cutoverEnabled: boolean;
-  coverage: unknown;
-  nowMs: number;
   trackingWritesConfirmed: boolean;
-  evidenceWritesConfirmed: boolean;
-  coverageAdvanced: boolean;
   accumulatorTtlConfirmed: boolean;
 }): boolean {
   if (!options.trackingWritesConfirmed || !options.accumulatorTtlConfirmed) return false;
-  if (!options.evidenceEligible) return true;
-  return options.cutoverEnabled
-    && options.evidenceWritesConfirmed
-    && options.coverageAdvanced
-    && forecastEvidenceCoversWindow(
-      options.coverage,
-      options.nowMs - FORECAST_EVIDENCE_MAX_LOOKBACK_MS,
-      options.nowMs,
-    );
+  return !options.evidenceEligible || options.cutoverEnabled;
 }
 
 /**
@@ -2504,9 +2559,9 @@ async function writeStoryTracking(
   // The archive/coverage keys are written raw (see the pipeline call below), so
   // getKeyPrefix() does NOT isolate them per deployment the way the accumulator
   // ZADD on the adjacent line is isolated. Preview and dev deployments share
-  // this Upstash instance, and the marker they would rewrite is the artefact
-  // that authorises destructive accumulator pruning — so production is the only
-  // deployment allowed to publish evidence at all.
+  // this Upstash instance, and the archive and marker they would rewrite are
+  // what forecast judging reads — so production is the only deployment allowed
+  // to publish evidence at all.
   const productionDeployment = (process.env.VERCEL_ENV ?? 'production') === 'production';
   const evidenceEligible = isEligibleForecastEvidence(variant, lang) && productionDeployment;
   const cutoverEnabled = process.env.FORECAST_EVIDENCE_CUTOVER_ENABLED === '1';
@@ -2622,11 +2677,12 @@ async function writeStoryTracking(
         // story:track — the member is a second stored copy of the link, so
         // it must not carry a hostile URL the track row blanks.
         if (evidenceEligible) {
+          const evidenceLink = storyTrackLinkForPersist(representative);
           const evidenceMember = buildForecastEvidenceMember(
             {
               hash,
               title: representative.title,
-              link: storyTrackLinkForPersist(representative),
+              link: evidenceLink,
               description: representative.description,
               publishedAt: representative.publishedAt,
             },
@@ -2637,7 +2693,11 @@ async function writeStoryTracking(
             // representative fields live in a self-contained, independently
             // retained record key, so refreshing one story cannot create a
             // second index member or crowd unique evidence out of the cap.
-            evidenceBatchCommands.push(['SET', forecastEvidenceRecordKey(hash), evidenceMember, 'EX', FORECAST_EVIDENCE_TTL_S]);
+            // A blanked link never replaces a stored link for the same story (#8990).
+            evidenceBatchCommands.push(buildForecastEvidenceRecordWrite(
+              forecastEvidenceRecordKey(hash), evidenceMember, evidenceLink, FORECAST_EVIDENCE_TTL_S, now,
+              evidenceLink ? '' : (representative.blankedLinkHost || forecastEvidenceLinkHost(representative.link)),
+            ));
             evidenceBatchCommands.push(['ZADD', FORECAST_EVIDENCE_KEY, nowStr, hash]);
             evidenceAttempted += 1;
           } else {
@@ -2823,18 +2883,10 @@ async function writeStoryTracking(
     coverageAdvanced = canAdvance && redisPipelineConfirmed(coverageResults, coverageCommands.length);
   }
 
-  // For the judged full/en accumulator, pruning is destructive migration:
-  // retain legacy evidence until backfill has installed a verified coverage
-  // marker AND this cycle's archive writes and coverage update are confirmed.
-  // Other accumulator scopes are not used by forecast judging.
   const pruneAllowed = shouldPruneAccumulator({
     evidenceEligible,
     cutoverEnabled,
-    coverage: coverageAfter,
-    nowMs: now,
     trackingWritesConfirmed,
-    evidenceWritesConfirmed,
-    coverageAdvanced,
     accumulatorTtlConfirmed,
   });
   let pruneConfirmed = true;
@@ -2866,7 +2918,7 @@ async function writeStoryTracking(
       `writes_confirmed=${evidenceWritesConfirmed} coverage_advanced=${coverageAdvanced} ` +
       `accumulator_ttl_confirmed=${accumulatorTtlConfirmed} maintenance_confirmed=${maintenanceConfirmed} ` +
       `accumulator_pruned=${pruneAllowed} accumulator_prune_confirmed=${pruneConfirmed} ` +
-      `cutover_enabled=${cutoverEnabled} cutover_verified=${pruneAllowed} ` +
+      `cutover_enabled=${cutoverEnabled} ` +
       `key=${FORECAST_EVIDENCE_KEY} ttl_s=${FORECAST_EVIDENCE_TTL_S}`;
     if (evidenceWritesConfirmed && coverageAdvanced && maintenanceConfirmed && pruneConfirmed) console.info(message);
     else console.warn(message);
@@ -3354,6 +3406,8 @@ export const __testing__ = {
   readRevokedUrlSet,
   suppressRevoked,
   fallbackDigestCache,
+  evictOldestIsolateEntry,
+  touchIsolateEntry,
   markFallbackCoverageStale,
   settleBeforeDeadline,
   finishSuccessfulDigestAttempt,

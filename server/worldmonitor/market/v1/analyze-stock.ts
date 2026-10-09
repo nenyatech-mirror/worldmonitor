@@ -12,6 +12,7 @@ import type {
 import { callLlm } from '../../../_shared/llm';
 import { cachedFetchJson, getCachedJson } from '../../../_shared/redis';
 import { CHROME_UA, yahooGate } from '../../../_shared/constants';
+import { sha256Hex } from '../../../_shared/hash';
 import { UPSTREAM_TIMEOUT_MS, sanitizeSymbol } from './_shared';
 import { storeStockAnalysisSnapshot } from './premium-stock-store';
 import { searchRecentStockHeadlines } from './stock-news-search';
@@ -933,7 +934,17 @@ export async function fetchExtendedHoursQuote(
 export type YahooHistoryOutcome =
   | { status: 'success'; history: { candles: Candle[]; currency: string } }
   | { status: 'invalid-symbol' }
-  | { status: 'unavailable' };
+  | { status: 'unavailable' }
+  /** The request itself rejected (timeout, network). Transient, so never negatively cached as absence. */
+  | { status: 'request-failed' };
+
+/** Thrown inside a cache fetcher so `cachedFetchJson` applies its short fetcher-error TTL. */
+class YahooHistoryRequestFailedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'YahooHistoryRequestFailedError';
+  }
+}
 
 function isDefinitiveYahooInvalidSymbol(status: number, data: YahooChartResponse | null): boolean {
   if (status === 404) return true;
@@ -947,10 +958,15 @@ function isDefinitiveYahooInvalidSymbol(status: number, data: YahooChartResponse
 export async function fetchYahooHistoryOutcome(symbol: string): Promise<YahooHistoryOutcome> {
   await yahooGate();
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=6mo&interval=1d&includePrePost=true&events=div,splits`;
-  const response = await fetch(url, {
-    headers: { 'User-Agent': CHROME_UA },
-    signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
-  });
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      headers: { 'User-Agent': CHROME_UA },
+      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+    });
+  } catch {
+    return { status: 'request-failed' };
+  }
   const data = await response.json().catch(() => null) as YahooChartResponse | null;
   if (isDefinitiveYahooInvalidSymbol(response.status, data)) return { status: 'invalid-symbol' };
   if (!response.ok || !data) return { status: 'unavailable' };
@@ -1969,6 +1985,21 @@ export type AnalyzeStockOptions = {
   now?: Date;
 };
 
+// The cached row returns `name` verbatim and feeds it to the LLM, so the key
+// must cover the whole name. A lossy form let distinct names share one row
+// across callers (GHSA-2fp6-mhpm-9gvh).
+export async function buildAnalyzeStockCacheKey(
+  symbol: string,
+  name: string,
+  includeNews: boolean,
+): Promise<string> {
+  const nameSuffix = name !== symbol ? `:${(await sha256Hex(name)).slice(0, 32)}` : '';
+  // v7 -> v8: expose the fundamentals-blended rating through the additive
+  // ratingSignal field while preserving the legacy technical signal/signalScore
+  // pair for already-loaded web, desktop, and API clients.
+  return `market:analyze-stock:v8:${symbol}:${includeNews ? 'news' : 'no-news'}${nameSuffix}`;
+}
+
 export async function analyzeStock(
   _ctx: ServerContext,
   req: AnalyzeStockRequest,
@@ -1981,18 +2012,20 @@ export async function analyzeStock(
 
   const name = (req.name || symbol).trim().slice(0, 120) || symbol;
   const includeNews = req.includeNews === true;
-  const nameSuffix = name !== symbol ? `:${name.replace(/[^a-zA-Z0-9]/g, '').slice(0, 30).toLowerCase()}` : '';
-  // v7 -> v8: expose the fundamentals-blended rating through the additive
-  // ratingSignal field while preserving the legacy technical signal/signalScore
-  // pair for already-loaded web, desktop, and API clients.
-  const cacheKey = `market:analyze-stock:v8:${symbol}:${includeNews ? 'news' : 'no-news'}${nameSuffix}`;
+  const cacheKey = await buildAnalyzeStockCacheKey(symbol, name, includeNews);
 
   const fetchFreshAnalysis = async (): Promise<AnalyzeStockResponse | null> => {
-    const [history, analystData] = await Promise.all([
-      fetchYahooHistory(symbol),
+    const [historyOutcome, analystData] = await Promise.all([
+      fetchYahooHistoryOutcome(symbol),
       fetchYahooAnalystData(symbol),
     ]);
-    if (!history) return null;
+    // Throwing, not returning null, keeps a timeout on cachedFetchJson's 30s
+    // fetcher-error TTL (and its warning) rather than a 120s negative cache.
+    if (historyOutcome.status === 'request-failed') {
+      throw new YahooHistoryRequestFailedError(`Yahoo history request failed for ${symbol}`);
+    }
+    if (historyOutcome.status !== 'success') return null;
+    const history = historyOutcome.history;
 
     const technical = buildTechnicalSnapshot(history.candles);
     technical.currency = history.currency || 'USD';
@@ -2055,15 +2088,22 @@ export async function analyzeStock(
     return response;
   };
 
-  const cached = options.now
-    ? await fetchFreshAnalysis()
-    : await cachedFetchJson<AnalyzeStockResponse>(cacheKey, CACHE_TTL_SECONDS, fetchFreshAnalysis, undefined, {
-        // Worst-case fetcher budget: 2× UPSTREAM_TIMEOUT_MS sequenced (10s+10s for
-        // history/analyst then headlines/dividend) + 20s LLM overlay + small
-        // overhead. 60s safely sits above this so the cache safety net (#3539)
-        // doesn't pre-empt the caller's own per-stage timeouts.
-        timeoutMs: 60_000,
-      });
+  let cached: AnalyzeStockResponse | null;
+  try {
+    cached = options.now
+      ? await fetchFreshAnalysis()
+      : await cachedFetchJson<AnalyzeStockResponse>(cacheKey, CACHE_TTL_SECONDS, fetchFreshAnalysis, undefined, {
+          // Worst-case fetcher budget: 2× UPSTREAM_TIMEOUT_MS sequenced (10s+10s for
+          // history/analyst then headlines/dividend) + 20s LLM overlay + small
+          // overhead. 60s safely sits above this so the cache safety net (#3539)
+          // doesn't pre-empt the caller's own per-stage timeouts.
+          timeoutMs: 60_000,
+        });
+  } catch (err) {
+    // A Yahoo timeout is an unavailable analysis, not a 500 (WORLDMONITOR-ZQ).
+    if (!(err instanceof YahooHistoryRequestFailedError)) throw err;
+    cached = null;
+  }
 
   if (cached) return cached;
 

@@ -44,7 +44,21 @@ export type McpInboundHostClass =
   | 'vercel_preview'
   | 'other';
 
+export type ConflictSourceObservation = {
+  ucdp: {
+    fetchedAt?: number;
+    candidateVersion?: string | null;
+    candidateComplete?: boolean;
+    annualFailedPages?: number;
+  };
+};
+
 export interface McpToolExecutionContext {
+  readAccountAllowance?: () => Promise<import('./_account-allowance').McpAllowanceStatus>;
+  panelRequest?: import('./panel-requests').PaidPanelAdmission;
+  panelScope?: 'forecasts';
+  // Set only by dispatch after a dedicated paid country-panel read is authorized.
+  countryPanelCode?: string;
   inboundHostClass: McpInboundHostClass;
   downstreamOrigin: string;
   downstreamOriginTag: string;
@@ -55,6 +69,7 @@ export interface McpToolExecutionContext {
 // ---------------------------------------------------------------------------
 export interface BaseToolDef {
   name: string;
+  title?: string;
   description: string;
   inputSchema: {
     type: string;
@@ -123,7 +138,6 @@ export interface BaseToolDef {
   // https://modelcontextprotocol.io/specification/2025-06-18/server/tools
   //
   //   - readOnlyHint: "If true, the tool does not modify its environment."
-  //     Every tool here is true — none write/mutate any user-visible state.
   //     Consuming a daily Pro quota counter is NOT environment modification
   //     in the spec sense (which targets the read/write split on the data
   //     plane, not metering on the auth plane).
@@ -171,6 +185,7 @@ export interface BaseToolDef {
   // constructs the public `_meta` object from it). Optional: only tools with
   // an interactive UI surface set it.
   _uiResourceUri?: string;
+  _openaiEntrypoints?: Array<{ type: 'global' | 'thread' }>;
 }
 
 // Per-entity content-freshness contract (#6080). `maxStaleMin` and
@@ -227,6 +242,12 @@ export interface CacheToolDef extends BaseToolDef {
   // the dispatcher reads this list directly with no synthesized fallback.
   _freshnessChecks: [FreshnessCheck, ...FreshnessCheck[]];
   _execute?: never;
+  // Optional argument-free projection of the stored values onto the fields the
+  // tool's `outputSchema` declares, applied to the label-walked `data` map
+  // before `_postFilter` and summary. Use it when the Redis value carries
+  // producer-internal blocks the public contract withholds. A throw fails the
+  // call; there is no fallback to the unprojected value.
+  _project?: (data: Record<string, unknown>) => Record<string, unknown>;
   // Optional in-memory post-filter applied to the label-walked `data` map
   // AFTER the Redis reads + freshness + cache_all_null guard. Pure narrowing:
   // receives the assembled data object plus the tools/call `arguments`, returns
@@ -235,7 +256,7 @@ export interface CacheToolDef extends BaseToolDef {
   // are no-ops, never errors. Every property a `_postFilter` reads MUST be
   // declared in the same tool's `inputSchema.properties` (schema and behaviour
   // co-located so the advertised contract can never drift from what runs).
-  _postFilter?: (data: Record<string, unknown>, params: Record<string, unknown>) => Record<string, unknown>;
+  _postFilter?: (data: Record<string, unknown>, params: Record<string, unknown>, execution?: McpToolExecutionContext) => Record<string, unknown>;
   // Optional tool-specific summary transform. Most cache tools use the shared
   // `summarizeData`; tools with tighter output invariants can preserve the
   // shared count/sample shape while additionally bounding optional samples.
@@ -320,6 +341,7 @@ export interface ApplyJmespathResult {
 // ---------------------------------------------------------------------------
 export interface PublicToolShape {
   name: string;
+  title?: string;
   description: string;
   inputSchema: {
     type: string;
@@ -354,6 +376,7 @@ export interface PublicToolShape {
   _meta: {
     ui?: { resourceUri: string };
     'ui/resourceUri'?: string;
+    'openai/ui'?: { entrypoints: Array<{ type: 'global' | 'thread' }> };
     'worldmonitor/access': McpAccessClass;
     'worldmonitor/weight': number;
   };

@@ -134,11 +134,11 @@ it('preserves a genuine PizzINT miss as a cacheable empty response', async () =>
   assert.match(response.headers.get('Cache-Control') ?? '', /^private, max-age=300(?:,|$)/);
   assert.deepEqual(await response.json(), { tensionPairs: [] });
 });
-it('preserves PizzINT includeGdelt filtering on a valid seed', async () => {
+it('never serves legacy PizzINT tension scores as World Monitor scores', async () => {
   mode = 'hit';
   const payload = { pizzint: { locations: [], defconLevel: 5 }, tensionPairs: [{ pair: 'usa_china' }] };
   cache.set('intelligence:pizzint:seed:v1', payload);
-  assert.deepEqual((await (await request('intelligence/v1/get-pizzint-status?include_gdelt=true')).json()).tensionPairs, payload.tensionPairs);
+  assert.deepEqual((await (await request('intelligence/v1/get-pizzint-status?include_gdelt=true')).json()).tensionPairs, []);
   assert.deepEqual((await (await request('intelligence/v1/get-pizzint-status?include_gdelt=false')).json()).tensionPairs, []);
 });
 for (const entry of cases.filter(entry => !entry.path.includes('pizzint'))) {
@@ -163,6 +163,35 @@ it('preserves a valid empty crypto sector collection', async () => {
   assert.deepEqual(await response.json(), { sectors: [] });
 });
 
+it('keeps a partial oil snapshot over a failed section read out of HTTP caches', async () => {
+  // One errored section (SPR 503) with the other keys hitting must not look
+  // like "SPR does not exist": the partial body carries a fresh updatedAt but
+  // must be no-store so the slow-tier cache cannot persist the partial lie.
+  const key = 'economic:crude-inventories:v1';
+  cache.set(key, { weeks: [{ period: '2026-09-01', stocksMb: 440 }] });
+  const sprUrl = 'https://cache-redis.invalid/get/economic%3Aspr%3Av1';
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: unknown, init?: unknown) => {
+    if (String(input) === sprUrl) return new Response('', { status: 503 });
+    return (realFetch as typeof fetch)(input as never, init as never);
+  }) as typeof fetch;
+  try {
+    mode = 'hit';
+    const partial = await request('economic/v1/get-oil-inventories');
+    assertNoStore(partial);
+    const partialBody = await partial.json();
+    assert.equal(partialBody.crudeWeeks[0].stocksMb, 440);
+    assert.equal(partialBody.spr, undefined);
+    // The absent section is UNKNOWN, not empty, so the snapshot must not claim
+    // an as-of-now freshness the failed read cannot support. The no-store
+    // header stops HTTP caches; blanking updatedAt is what tells the caller,
+    // matching the two sibling failure branches in the same handler.
+    assert.equal(partialBody.updatedAt, '', 'a partial snapshot must not claim a fresh timestamp');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
 it('keeps an oil mapping exception out of HTTP caches without a fresh timestamp', async () => {
   mode = 'hit';
   cache.set('economic:crude-inventories:v1', { weeks: [null] });
@@ -176,7 +205,7 @@ const requiredCases = [
   ['intelligence/v1/get-social-velocity', 'intelligence:social:reddit:v1', { posts: [], fetchedAt: 123 }, 'posts'],
   ['intelligence/v1/list-cross-source-signals', 'intelligence:cross-source-signals:v1', { signals: [] }, 'signals'],
   ['intelligence/v1/list-satellites', 'intelligence:satellites:tle:v1', { satellites: [] }, 'satellites'],
-  ['intelligence/v1/list-security-advisories', 'intelligence:advisories:v1', { advisories: [] }, 'advisories'],
+  ['intelligence/v1/list-security-advisories', 'intelligence:advisories:v1', { advisories: [], byCountry: {} }, 'advisories'],
   ['seismology/v1/list-earthquakes', 'seismology:earthquakes:v1', { earthquakes: [] }, 'earthquakes'],
   ['unrest/v1/list-unrest-events', 'unrest:events:v1', { events: [] }, 'events'],
   ['market/v1/get-sector-summary', 'market:sectors:v2', { sectors: [] }, 'sectors'],
@@ -319,6 +348,24 @@ it('World Bank failure is 503 without cache writes and a zero-record provider re
   assert.equal(recovered.status, 200);
   assert.deepEqual((await recovered.json()).data, []);
 });
+it('World Bank serves a seeded all snapshot when the live provider is 503', async () => {
+  const currentYear = new Date().getFullYear();
+  mode = 'hit';
+  cache.set(`economic:worldbank:v2:SP.POP.TOTL:all:5:${currentYear}`, {
+    data: [{
+      countryCode: 'USA',
+      countryName: 'United States',
+      indicatorCode: 'SP.POP.TOTL',
+      indicatorName: 'Population',
+      year: currentYear - 1,
+      value: 1,
+    }],
+  });
+  const response = await request('economic/v1/list-world-bank-indicators?indicator_code=SP.POP.TOTL&country_code=US');
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).data[0].countryCode, 'USA');
+  assert.equal(writes, 0);
+});
 it('default crypto missing seed is degraded and no-store', async () => {
   const response = await request('market/v1/list-crypto-quotes');
   assertNoStore(response);
@@ -358,3 +405,42 @@ for (const payload of [{}, [{ total: null }, null], [{ total: 1 }, {}]]) {
     assert.equal(writes, 0);
   });
 }
+
+it('serves bounded dyad scores independently of a missing pizza payload', async () => {
+  mode = 'hit';
+  const pair = { id: 'usa_russia', countries: ['US', 'RU'], label: 'US–Russia', score: 50,
+    trend: 'TREND_DIRECTION_STABLE', changePercent: 0, region: 'global' };
+  cache.set('gdelt:bulk:dyad-tension:v1', { updatedAt: Date.now(), tensionPairs: [pair, { ...pair, score: 101 }] });
+  const response = await request('intelligence/v1/get-pizzint-status?include_gdelt=true');
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.pizzint, undefined);
+  assert.deepEqual(body.tensionPairs, [pair]);
+  assertNoStore(response);
+  const pizzaOnly = await request('intelligence/v1/get-pizzint-status?include_gdelt=false');
+  assert.deepEqual((await pizzaOnly.json()).tensionPairs, []);
+});
+
+it('does not discard tensions when only the pizza Redis read fails', async () => {
+  mode = 'hit';
+  const pair = { id: 'usa_russia', countries: ['US', 'RU'], label: 'US–Russia', score: 50,
+    trend: 'TREND_DIRECTION_STABLE', changePercent: 0, region: 'global' };
+  cache.set('gdelt:bulk:dyad-tension:v1', { updatedAt: Date.now(), tensionPairs: [pair] });
+  const redisFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => decodeURIComponent(String(input)).includes('intelligence:pizzint:seed:v1')
+    ? new Response('', { status: 503 }) : redisFetch(input, init);
+  const response = await request('intelligence/v1/get-pizzint-status?include_gdelt=true');
+  assertNoStore(response);
+  assert.deepEqual((await response.json()).tensionPairs, [pair]);
+});
+
+it('withholds stale dyad scores while preserving pizza data', async () => {
+  mode = 'hit';
+  cache.set('intelligence:pizzint:seed:v1', { pizzint: { locations: [], defconLevel: 5 } });
+  cache.set('gdelt:bulk:dyad-tension:v1', { updatedAt: Date.now() - 46 * 60_000,
+    tensionPairs: [{ id: 'usa_russia', score: 50, changePercent: 0 }] });
+  const response = await request('intelligence/v1/get-pizzint-status?include_gdelt=true');
+  const body = await response.json();
+  assert.equal(body.pizzint.defconLevel, 5);
+  assert.deepEqual(body.tensionPairs, []);
+});

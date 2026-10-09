@@ -11,7 +11,7 @@ import { internal } from "../_generated/api";
 import { PRODUCT_CATALOG } from "../config/productCatalog";
 import { createCustomerPortalUrlForUser } from "./billing";
 import { buildCancellationConfirmEmail } from "./cancellationEmailCopy";
-import { isCoveringAt } from "./subscriptionHelpers";
+import { billingDeletionForEvent, billingDeletionForUser, isCoveringAt } from "./subscriptionHelpers";
 
 export { formatAccessEndDate } from "./cancellationEmailCopy";
 
@@ -373,6 +373,11 @@ function buildPriceRowsHtml(args: {
  * Send welcome email to user + admin notification on new subscription.
  * Scheduled from handleSubscriptionActive via ctx.scheduler.
  */
+export const canSendBillingEmail = internalQuery({
+  args: { userId: v.string() },
+  handler: async (ctx, args) => !(await billingDeletionForUser(ctx, args.userId)),
+});
+
 export const sendSubscriptionEmails = internalAction({
   args: {
     userEmail: v.string(),
@@ -392,7 +397,9 @@ export const sendSubscriptionEmails = internalAction({
     // email to the checkout inbox, and the Billing Email row for admin.
     checkoutEmail: v.optional(v.string()),
   },
-  handler: async (_ctx, args) => {
+  handler: async (ctx, args) => {
+    const canSend = () => ctx.runQuery(internal.payments.subscriptionEmails.canSendBillingEmail, { userId: args.userId });
+    if (!await canSend()) return;
     const apiKey = process.env.RESEND_API_KEY;
     if (!apiKey) {
       console.error("[subscriptionEmails] RESEND_API_KEY not set");
@@ -427,6 +434,7 @@ export const sendSubscriptionEmails = internalAction({
     }
 
     // 1b. Sign-in pointer to the checkout inbox (#6330) — see sendSignInPointer.
+    if (!await canSend()) return;
     if (args.checkoutEmail) {
       await sendSignInPointer(apiKey, args.checkoutEmail, args.userEmail, planName);
     }
@@ -434,6 +442,7 @@ export const sendSubscriptionEmails = internalAction({
     // 2. Admin notification — leads with what the user actually paid (and how
     // it compares to list price) instead of the opaque subscription_id, which
     // is rarely the question being asked when this email lands.
+    if (!await canSend()) return;
     const priceRows = buildPriceRowsHtml({
       planKey: args.planKey,
       recurringPreTaxAmount: args.recurringPreTaxAmount,
@@ -475,6 +484,8 @@ export const sendSubscriptionEmails = internalAction({
  */
 export const sendReactivationEmail = internalAction({
   args: {
+    // Legacy queued jobs lack an owner; skip them instead of mailing a deleted account.
+    userId: v.optional(v.string()),
     userEmail: v.string(),
     planKey: v.string(),
     // #6330: same contract as sendSubscriptionEmails — set only when the Dodo
@@ -482,7 +493,11 @@ export const sendReactivationEmail = internalAction({
     // checkout is exactly as capable of alias divergence as a first one.
     checkoutEmail: v.optional(v.string()),
   },
-  handler: async (_ctx, args) => {
+  handler: async (ctx, args) => {
+    const userId = args.userId;
+    if (!userId) return;
+    const canSend = () => ctx.runQuery(internal.payments.subscriptionEmails.canSendBillingEmail, { userId });
+    if (!await canSend()) return;
     const apiKey = process.env.RESEND_API_KEY;
     if (!apiKey) {
       console.error("[subscriptionEmails] RESEND_API_KEY not set");
@@ -521,6 +536,7 @@ export const sendReactivationEmail = internalAction({
 
     // Sign-in pointer to the checkout inbox — same rationale as the welcome
     // path (#6330); best-effort by construction.
+    if (!await canSend()) return;
     if (args.checkoutEmail) {
       await sendSignInPointer(apiKey, args.checkoutEmail, args.userEmail, planName);
     }
@@ -543,6 +559,11 @@ export const sendReactivationEmail = internalAction({
 // ===========================================================================
 
 const DAY_MS = 86_400_000;
+// The scan retries an unsent day-0 only once the hold is at least this old.
+// Younger holds belong to the webhook's own send, which may still be in its
+// portal mint or Resend slot wait; a scan copy started then could pass the
+// ledger check before either records and send the email twice.
+export const DUNNING_DAY0_RETRY_MIN_AGE_MS = 60 * 60 * 1000;
 export const DUNNING_DAY3_AGE_MS = 3 * DAY_MS;
 export const DUNNING_DAY7_AGE_MS = 7 * DAY_MS;
 // Winback window bounds, measured from currentPeriodEnd (access end).
@@ -611,7 +632,7 @@ export const getDunningContext = internalQuery({
         q.eq("dodoSubscriptionId", args.dodoSubscriptionId),
       )
       .unique();
-    if (!sub) return null;
+    if (!sub || await billingDeletionForUser(ctx, sub.userId)) return null;
 
     // Recipient resolution mirrors the portal's trust order: the sub's own
     // rawPayload email first (per-Clerk-userId by construction), then the
@@ -693,6 +714,11 @@ export const recordDunningStepSent = internalMutation({
     email: v.string(),
   },
   handler: async (ctx, args) => {
+    const deletion = await billingDeletionForEvent(ctx, { subscription_id: args.dodoSubscriptionId });
+    // Deleted accounts keep the dunning ledger row with the real recipient
+    // email as retained billing evidence (owner decision 2026-09-21), but a
+    // tombstoned subscription must never trigger or fund another send.
+    if (deletion) return;
     await ctx.db.insert("dunningEmails", {
       dodoSubscriptionId: args.dodoSubscriptionId,
       step: args.step,
@@ -812,6 +838,12 @@ export function buildDunningEmail(
  * concurrent reservations serialize, so no two callers get overlapping slots.
  * The cursor floors at `now`, so after any idle gap the next send fires
  * immediately instead of sleeping toward a stale future slot.
+ *
+ * Under portal-latency bunching, many actions can call this at once and
+ * Convex's in-mutation OCC retries can exhaust (WORLDMONITOR-17R / 17S).
+ * Callers MUST use `reserveResendSlotWithOccRetry` so a fresh mutation
+ * attempt (with jittered backoff) absorbs that exhaustion instead of
+ * dropping the dunning send for the tick.
  */
 export const reserveResendSlot = internalMutation({
   args: {},
@@ -828,6 +860,60 @@ export const reserveResendSlot = internalMutation({
     return slotAt;
   },
 });
+
+/**
+ * Convex permanent OCC failure after the mutation's built-in retries are spent.
+ * Matches Convex's message text (docs.convex.dev/error#1); there is no error
+ * code to key on. If Convex rewords it, this returns false and the send fails
+ * as it did before the retry existed: the action throws before the Resend POST
+ * and writes no ledger row.
+ */
+export function isConvexOccExhaustedError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return (
+    msg.includes("changed while this mutation was being run") &&
+    msg.includes("on every subsequent retry")
+  );
+}
+
+// Action-level ladder around reserveResendSlot. Each attempt is a fresh
+// mutation with its own OCC retry budget; jitter spreads concurrent losers
+// so they do not re-herd on the same tick (WORLDMONITOR-17R).
+export const RESEND_SLOT_OCC_MAX_ATTEMPTS = 8;
+export const RESEND_SLOT_OCC_BASE_DELAY_MS = 25;
+
+export async function reserveResendSlotWithOccRetry(
+  run: () => Promise<number>,
+  opts?: {
+    sleep?: (ms: number) => Promise<void>;
+    maxAttempts?: number;
+    baseDelayMs?: number;
+    random?: () => number;
+  },
+): Promise<number> {
+  const maxAttempts = opts?.maxAttempts ?? RESEND_SLOT_OCC_MAX_ATTEMPTS;
+  const baseDelayMs = opts?.baseDelayMs ?? RESEND_SLOT_OCC_BASE_DELAY_MS;
+  const sleep =
+    opts?.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const random = opts?.random ?? Math.random;
+  if (!Number.isInteger(maxAttempts) || maxAttempts < 1) {
+    throw new Error("reserveResendSlotWithOccRetry: maxAttempts must be a positive integer");
+  }
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await run();
+    } catch (err) {
+      lastError = err;
+      if (!isConvexOccExhaustedError(err) || attempt === maxAttempts) throw err;
+      const delay = Math.round(
+        baseDelayMs * 2 ** (attempt - 1) * (0.5 + random()),
+      );
+      await sleep(delay);
+    }
+  }
+  throw lastError;
+}
 
 /**
  * The wait (ms) a send owes before its reserved Resend slot. Deliberately
@@ -992,9 +1078,10 @@ export const sendDunningEmail = internalAction({
     // start-time staggering alone can't guarantee (review follow-up to
     // WORLDMONITOR-VH). The wait is intentionally uncapped (see resendPacingWaitMs)
     // so a large backlog stays serialized instead of collapsing into a burst.
-    const slotAt = await ctx.runMutation(
-      internal.payments.subscriptionEmails.reserveResendSlot,
-      {},
+    // Action-level OCC retry: portal bunching can exhaust Convex's in-mutation
+    // retries on the shared counters row (Sentry WORLDMONITOR-17R / 17S).
+    const slotAt = await reserveResendSlotWithOccRetry(() =>
+      ctx.runMutation(internal.payments.subscriptionEmails.reserveResendSlot, {}),
     );
     const waitMs = resendPacingWaitMs(slotAt, Date.now());
     if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs));
@@ -1051,9 +1138,15 @@ export const runDunningScan = internalMutation({
     for (const sub of onHold) {
       const episodeAt = sub.onHoldAt ?? sub.updatedAt;
       const age = now - episodeAt;
+      // Day-0 is first enqueued by the on_hold webhook, but a send that throws
+      // (Resend error, exhausted slot OCC, RESEND_API_KEY missing at webhook
+      // time) leaves no ledger row and is never auto-retried. Retry it here
+      // until day-3 takes over; the ledger pre-check below skips a day-0
+      // that already went out.
       const step: DunningStep | null =
         age >= DUNNING_DAY7_AGE_MS ? "dunning_day7"
         : age >= DUNNING_DAY3_AGE_MS ? "dunning_day3"
+        : age >= DUNNING_DAY0_RETRY_MIN_AGE_MS ? "dunning_day0"
         : null;
       if (step) due.push({ dodoSubscriptionId: sub.dodoSubscriptionId, step, episodeAt });
     }

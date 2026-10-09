@@ -14,7 +14,7 @@ export const config = { runtime: 'edge' };
 // @ts-expect-error — JS module, no declaration file
 import { getCorsHeaders } from './_cors.js';
 // @ts-expect-error — JS module, no declaration file
-import { captureEdgeException, captureSilentError } from './_sentry-edge.js';
+import { captureSilentError } from './_sentry-edge.js';
 import {
   beginStandaloneIdempotency,
   completeStandaloneIdempotency,
@@ -164,6 +164,7 @@ async function publishWelcome(userId: string, channelType: string): Promise<void
     console.error('[notification-channels] publishWelcome LPUSH failed:', (err as Error).message);
     await captureSilentError(err, {
       tags: { route: 'api/notification-channels', step: 'publish-welcome' },
+      fingerprint: ['api/notification-channels', 'publish-welcome', err instanceof Error ? err.name : 'Error'],
     });
   }
 }
@@ -184,6 +185,7 @@ async function publishFlushHeld(userId: string, variant: string): Promise<void> 
     await captureSilentError(err, {
       level: 'warning',
       tags: { route: 'api/notification-channels', step: 'publish-flush-held', severity: 'warn' },
+      fingerprint: ['api/notification-channels', 'publish-flush-held', err instanceof Error ? err.name : 'Error'],
     });
   }
 }
@@ -351,8 +353,22 @@ export default async function handler(req: Request, ctx: { waitUntil: (p: Promis
       const data = await resp.json();
       return json(data, 200, corsHeaders, true);
     } catch (err) {
+      // AbortSignal.timeout(CONVEX_RELAY_TIMEOUT_MS) on the Convex relay
+      // surfaces as TimeoutError / AbortError when the host is slow. The
+      // handler already returns 500; downgrade the Sentry capture to warning
+      // so one-shot relay timeouts stay queryable without drowning real bugs
+      // (auth wiring, JSON parse, non-timeout fetch failures). Same gate as
+      // api/miit-news and api/_relay (Sentry WORLDMONITOR-17N).
       console.error('[notification-channels] GET error:', err);
-      captureEdgeException(err, { handler: 'notification-channels', method: 'GET' }, ctx);
+      const errName = err instanceof Error ? err.name : '';
+      const isTransientTimeout = errName === 'AbortError' || errName === 'TimeoutError';
+      captureSilentError(err, {
+        tags: { route: 'api/notification-channels', method: 'GET' },
+        extra: { handler: 'notification-channels', method: 'GET' },
+        fingerprint: ['api/notification-channels', 'GET', err instanceof Error ? err.name : 'Error'],
+        ctx,
+        ...(isTransientTimeout ? { level: 'warning' } : {}),
+      });
       return json({ error: 'Failed to fetch' }, 500, corsHeaders);
     }
   }
@@ -451,6 +467,7 @@ export default async function handler(req: Request, ctx: { waitUntil: (p: Promis
                 code: code as string,
                 severity: 'warn',
               },
+              fingerprint: ['api/notification-channels', 'billing-verification-denial', 'Error'],
               ctx,
             },
           );
@@ -780,8 +797,17 @@ export default async function handler(req: Request, ctx: { waitUntil: (p: Promis
 
       return finish(json({ error: 'Unknown action' }, 400, corsHeaders));
     } catch (err) {
+      // Same AbortSignal.timeout gate as GET — see comment there.
       console.error('[notification-channels] POST error:', err);
-      captureEdgeException(err, { handler: 'notification-channels', method: 'POST' }, ctx);
+      const errName = err instanceof Error ? err.name : '';
+      const isTransientTimeout = errName === 'AbortError' || errName === 'TimeoutError';
+      captureSilentError(err, {
+        tags: { route: 'api/notification-channels', method: 'POST' },
+        extra: { handler: 'notification-channels', method: 'POST' },
+        fingerprint: ['api/notification-channels', 'POST', err instanceof Error ? err.name : 'Error'],
+        ctx,
+        ...(isTransientTimeout ? { level: 'warning' } : {}),
+      });
       return finish(json({ error: 'Operation failed' }, 500, corsHeaders));
     }
   }

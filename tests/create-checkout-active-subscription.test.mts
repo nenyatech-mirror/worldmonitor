@@ -10,9 +10,10 @@ function restoreEnv(): void {
   Object.assign(process.env, originalEnv);
 }
 
-async function importFreshCreateCheckout() {
+async function importFreshCreateCheckout(options: { missingGatewaySecret?: boolean } = {}) {
   process.env.CONVEX_SITE_URL = 'https://convex.test';
-  process.env.CONVEX_TENANT_RELAY_SECRET = 'relay-secret';
+  if (options.missingGatewaySecret) delete process.env.CONVEX_TENANT_RELAY_SECRET;
+  else process.env.CONVEX_TENANT_RELAY_SECRET = 'relay-secret';
   return import(`../api/create-checkout.ts?test=${Date.now()}-${Math.random()}`);
 }
 
@@ -34,6 +35,21 @@ function makeCheckoutRequest(): Request {
 afterEach(() => {
   mock.restoreAll();
   restoreEnv();
+});
+
+it('reproduces the missing gateway credential 503 without using the ingestion key', async () => {
+  process.env.RELAY_SHARED_SECRET = 'synthetic-ingestion-secret';
+  const mod = await importFreshCreateCheckout({ missingGatewaySecret: true });
+  const relayFetch = mock.fn(async () => Response.json({}));
+  mod.__setCreateCheckoutDepsForTests({
+    validateBearerToken: async () => ({ valid: true, userId: 'user_test' }),
+    checkRateLimit: async () => null,
+    fetch: relayFetch,
+  });
+  const response = await mod.default(makeCheckoutRequest());
+  assert.equal(response.status, 503);
+  assert.deepEqual(await response.json(), { error: 'Service unavailable' });
+  assert.equal(relayFetch.mock.calls.length, 0);
 });
 
 describe('/api/create-checkout ACTIVE_SUBSCRIPTION_EXISTS relay handling', () => {
@@ -226,6 +242,21 @@ it('forwards invalid checkout product as HTTP 400 without a transport retry sign
   assert.equal(response.status, 400);
   assert.deepEqual(await response.json(), { error: 'INVALID_CHECKOUT_PRODUCT' });
   assert.equal(relayFetch.mock.calls.length, 1);
+});
+
+it('masks unexpected relay exception text while retaining server diagnostics', async () => {
+  const mod = await importFreshCreateCheckout();
+  const log = mock.method(console, 'error', () => {});
+  const sentinel = 'synthetic-private-relay-detail';
+  mod.__setCreateCheckoutDepsForTests({
+    validateBearerToken: async () => ({ valid: true, userId: 'user_error_boundary' }),
+    checkRateLimit: async () => null,
+    fetch: async () => Response.json({ error: sentinel }, { status: 500 }),
+  });
+  const response = await mod.default(makeCheckoutRequest());
+  assert.equal(response.status, 500);
+  assert.deepEqual(await response.json(), { error: 'CHECKOUT_FAILED' });
+  assert.ok(JSON.stringify(log.mock.calls).includes(sentinel));
 });
 
 it('replays a completed account-scoped checkout without reaching admission at the relay', async () => {

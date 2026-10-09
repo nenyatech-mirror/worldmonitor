@@ -1,16 +1,29 @@
 import type {
   ForecastServiceHandler,
   GetForecastScorecardResponse,
+  MarketAlertScorecard,
   ServerContext,
 } from '../../../../src/generated/server/worldmonitor/forecast/v1/service_server';
+// @ts-expect-error — JS module, no declaration file
+import { captureSilentError } from '../../../../api/_sentry-edge.js';
+import { FORECAST_ACCURACY_AUDIT, type ForecastAccuracyAudit } from '../../../../shared/forecast-accuracy-audit.js';
 import { markNoStoreFallbackResponse } from '../../../_shared/response-headers';
+import { selectMarketAlertScorecard, selectScorecardFields } from './scorecard-fields';
 
 const REDIS_KEY = 'forecast:scorecard:v1';
+const MARKET_ALERTS_KEY = 'correlation:market-alerts:scorecard:v1';
 const MAX_STALE_MS = 2160 * 60 * 1000;
 
 interface ScorecardSeedEnvelope {
   _seed?: { fetchedAt?: unknown };
   data?: unknown;
+}
+
+// The same switch /accuracy/, scorecard.json, the panel and MCP read (#8990).
+export function scorecardUnderAudit(
+  audit: ForecastAccuracyAudit | null = FORECAST_ACCURACY_AUDIT,
+): Pick<GetForecastScorecardResponse, 'underAudit'> {
+  return audit ? { underAudit: { since: audit.since, reason: audit.reason, issue: audit.issue } } : {};
 }
 
 function emptyScorecard(overrides: Partial<GetForecastScorecardResponse> = {}): GetForecastScorecardResponse {
@@ -32,10 +45,14 @@ function emptyScorecard(overrides: Partial<GetForecastScorecardResponse> = {}): 
     byDomain: [],
     byGenerationOrigin: [],
     calibration: [],
+    publishedByDomain: [],
+    receipts: [],
+    familyOutcomes: [],
     degraded: false,
     stale: false,
     error: '',
     ...overrides,
+    ...scorecardUnderAudit(),
   };
 }
 
@@ -43,28 +60,18 @@ export const getForecastScorecard: ForecastServiceHandler['getForecastScorecard'
   ctx: ServerContext,
 ): Promise<GetForecastScorecardResponse> => {
   try {
-    const envelope = await getScorecardJson();
-    const data = envelope.data as Partial<GetForecastScorecardResponse> | null;
-    if (!data) return markNoStoreFallbackResponse(ctx.request, emptyScorecard());
+    const [envelope, marketAlerts] = await Promise.all([getSeedJson(REDIS_KEY), readMarketAlerts()]);
+    const data = envelope.data as Record<string, unknown> | null;
+    if (!data) return markNoStoreFallbackResponse(ctx.request, withMarketAlerts(emptyScorecard(), marketAlerts));
     const fetchedAt = Number(envelope.fetchedAt);
-    // Seeder observability and experiments are not part of the public proto.
-    // Select declared fields so new seed fields cannot implicitly become API fields.
-    return emptyScorecard({
-      schemaVersion: data.schemaVersion ?? 1,
-      generatedAt: data.generatedAt ?? 0,
-      rollingWindowDays: data.rollingWindowDays ?? 180,
-      methodology: data.methodology ?? '',
-      totals: data.totals ?? emptyScorecard().totals,
-      overall: data.overall,
-      byDomain: data.byDomain ?? [],
-      byGenerationOrigin: data.byGenerationOrigin ?? [],
-      calibration: data.calibration ?? [],
-      vsMarketSkill: data.vsMarketSkill,
-      skill: data.skill,
+    const response = withMarketAlerts(emptyScorecard({
+      ...selectScorecardFields(data),
       degraded: false,
       stale: Number.isFinite(fetchedAt) ? Date.now() - fetchedAt > MAX_STALE_MS : false,
       error: '',
-    });
+    }), marketAlerts);
+    // A missing block is never cached: the next request may find it.
+    return marketAlerts ? response : markNoStoreFallbackResponse(ctx.request, response);
   } catch (err) {
     console.error('[forecast] getForecastScorecard getRawJson failed:', err instanceof Error ? err.message : String(err));
     return emptyScorecard({
@@ -75,8 +82,28 @@ export const getForecastScorecard: ForecastServiceHandler['getForecastScorecard'
   }
 };
 
-async function getScorecardJson(): Promise<{ data: unknown | null; fetchedAt: number | null }> {
-  const raw = await getRawString(REDIS_KEY);
+// The market-alert block is a second key read on its own: a miss or a failed
+// read leaves it absent and never degrades the forecast scorecard.
+async function readMarketAlerts(): Promise<MarketAlertScorecard | undefined> {
+  try {
+    return selectMarketAlertScorecard((await getSeedJson(MARKET_ALERTS_KEY)).data);
+  } catch (err) {
+    console.error('[forecast] getForecastScorecard market-alerts read failed:', err instanceof Error ? err.message : String(err));
+    captureSilentError(err, { tags: { route: 'api/forecast', step: 'market-alerts-read' }, level: 'warning' });
+    return undefined;
+  }
+}
+
+function withMarketAlerts(
+  response: GetForecastScorecardResponse,
+  marketAlerts: MarketAlertScorecard | undefined,
+): GetForecastScorecardResponse {
+  if (marketAlerts) response.marketAlerts = marketAlerts;
+  return response;
+}
+
+async function getSeedJson(key: string): Promise<{ data: unknown | null; fetchedAt: number | null }> {
+  const raw = await getRawString(key);
   if (raw == null) return { data: null, fetchedAt: null };
   const parsed = JSON.parse(raw) as unknown;
   if (isScorecardSeedEnvelope(parsed)) {
